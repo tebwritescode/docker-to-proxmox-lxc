@@ -18,7 +18,7 @@ set -Eeuo pipefail
 # CONFIGURATION
 # =============================================================================
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 OCI_IMAGE="${OCI_IMAGE:-}"
 CT_NAME="${CT_NAME:-}"
 CT_MEMORY="${CT_MEMORY:-256}"
@@ -28,6 +28,13 @@ CT_BRIDGE="${CT_BRIDGE:-}"
 CT_STORAGE="${CT_STORAGE:-}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-}"
 NONINTERACTIVE="${NONINTERACTIVE:-}"
+CONFIG_FILE="${CONFIG_FILE:-}"
+
+# Config storage directory
+CONFIG_DIR="/etc/oci-to-lxc"
+
+# User-defined environment variables (populated during setup)
+declare -A USER_ENV_VARS
 
 # Auto-enable non-interactive if no TTY
 [[ ! -t 0 ]] && NONINTERACTIVE=1
@@ -98,6 +105,144 @@ check_deps() {
         apt-get install -y -qq "${missing[@]}" >/dev/null 2>&1
         msg_ok "Dependencies installed"
     fi
+}
+
+# =============================================================================
+# CONFIG FILE FUNCTIONS
+# =============================================================================
+
+list_configs() {
+    mkdir -p "$CONFIG_DIR"
+    local configs
+    configs=$(find "$CONFIG_DIR" -name "*.conf" -type f 2>/dev/null | sort)
+    echo "$configs"
+}
+
+load_config() {
+    local config_file="$1"
+
+    if [[ ! -f "$config_file" ]]; then
+        msg_error "Config file not found: ${config_file}"
+        return 1
+    fi
+
+    # Source the config file
+    # shellcheck disable=SC1090
+    source "$config_file"
+
+    # Load environment variables from config
+    while IFS='=' read -r key value; do
+        if [[ "$key" =~ ^ENV_ ]]; then
+            local env_name="${key#ENV_}"
+            USER_ENV_VARS["$env_name"]="$value"
+        fi
+    done < "$config_file"
+
+    msg_ok "Loaded config: $(basename "$config_file")"
+}
+
+save_config() {
+    local config_name="$1"
+
+    mkdir -p "$CONFIG_DIR"
+    local config_file="${CONFIG_DIR}/${config_name}.conf"
+
+    cat > "$config_file" << EOF
+# OCI-to-LXC Configuration
+# Generated: $(date)
+# Image: ${OCI_IMAGE}
+
+OCI_IMAGE="${OCI_IMAGE}"
+CT_NAME="${CT_NAME}"
+CT_MEMORY="${CT_MEMORY}"
+CT_CORES="${CT_CORES}"
+CT_DISK="${CT_DISK}"
+CT_BRIDGE="${CT_BRIDGE}"
+CT_STORAGE="${CT_STORAGE}"
+TEMPLATE_STORAGE="${TEMPLATE_STORAGE}"
+EOF
+
+    # Save environment variables
+    for key in "${!USER_ENV_VARS[@]}"; do
+        echo "ENV_${key}=\"${USER_ENV_VARS[$key]}\"" >> "$config_file"
+    done
+
+    msg_ok "Config saved: ${config_file}"
+}
+
+select_config() {
+    local configs
+    configs=$(list_configs)
+
+    if [[ -z "$configs" ]]; then
+        return 1
+    fi
+
+    local options=()
+    options+=("NEW" "Create new container" "ON")
+
+    while IFS= read -r conf; do
+        [[ -z "$conf" ]] && continue
+        local name
+        name=$(basename "$conf" .conf)
+        local image
+        image=$(grep "^OCI_IMAGE=" "$conf" 2>/dev/null | cut -d'"' -f2 | head -1)
+        options+=("$name" "${image:-unknown}" "OFF")
+    done <<< "$configs"
+
+    local selected
+    selected=$(whiptail --backtitle "OCI-to-LXC" \
+        --title "Configuration" \
+        --radiolist "Load existing config or create new?" 16 70 8 \
+        "${options[@]}" 3>&1 1>&2 2>&3) || return 1
+
+    if [[ "$selected" != "NEW" && -n "$selected" ]]; then
+        load_config "${CONFIG_DIR}/${selected}.conf"
+        return 0
+    fi
+
+    return 1
+}
+
+# =============================================================================
+# ENVIRONMENT VARIABLE FUNCTIONS
+# =============================================================================
+
+prompt_env_vars() {
+    # OCI_ENV contains environment variables from the image (excluding PATH)
+    [[ -z "$OCI_ENV" ]] && return 0
+
+    if [[ -n "$NONINTERACTIVE" ]]; then
+        # In non-interactive mode, use defaults or pre-set values
+        return 0
+    fi
+
+    msg "Environment variables from image:"
+
+    while IFS= read -r env_line; do
+        [[ -z "$env_line" ]] && continue
+
+        local env_name="${env_line%%=*}"
+        local env_default="${env_line#*=}"
+
+        # Skip if already set from config
+        if [[ -n "${USER_ENV_VARS[$env_name]:-}" ]]; then
+            msg "  ${env_name}=${USER_ENV_VARS[$env_name]} (from config)"
+            continue
+        fi
+
+        local user_value
+        user_value=$(whiptail --backtitle "OCI-to-LXC" \
+            --title "Environment Variable" \
+            --inputbox "${env_name}\n\nDefault: ${env_default}\n\nEnter value (or leave empty for default):" \
+            12 70 "" 3>&1 1>&2 2>&3) || true
+
+        if [[ -n "$user_value" ]]; then
+            USER_ENV_VARS["$env_name"]="$user_value"
+        else
+            USER_ENV_VARS["$env_name"]="$env_default"
+        fi
+    done <<< "$OCI_ENV"
 }
 
 # =============================================================================
@@ -237,13 +382,19 @@ create_template() {
     local rootfs="${WORK_DIR}/bundle/rootfs"
     local template_path="/var/lib/vz/template/cache/${template_name}.tar.gz"
 
-    # Create startup wrapper script with proper PATH
-    cat > "${rootfs}/etc/oci-start.sh" << EOFWRAPPER
-#!/bin/sh
-export ${OCI_PATH}
-cd ${OCI_WORKDIR}
-exec ${OCI_CMD:-/bin/sh}
-EOFWRAPPER
+    # Create startup wrapper script with proper PATH and environment
+    {
+        echo "#!/bin/sh"
+        echo "export ${OCI_PATH}"
+
+        # Add user-defined environment variables
+        for key in "${!USER_ENV_VARS[@]}"; do
+            echo "export ${key}=\"${USER_ENV_VARS[$key]}\""
+        done
+
+        echo "cd ${OCI_WORKDIR}"
+        echo "exec ${OCI_CMD:-/bin/sh}"
+    } > "${rootfs}/etc/oci-start.sh"
     chmod +x "${rootfs}/etc/oci-start.sh"
 
     # Create minimal inittab for running the OCI command
@@ -337,6 +488,14 @@ main() {
     check_pve
     check_deps
 
+    # Check for config file or offer to load existing
+    local config_loaded=0
+    if [[ -n "$CONFIG_FILE" ]]; then
+        load_config "$CONFIG_FILE" && config_loaded=1
+    elif [[ -z "$NONINTERACTIVE" ]]; then
+        select_config && config_loaded=1
+    fi
+
     # Get OCI image
     if [[ -z "$OCI_IMAGE" ]]; then
         if [[ -n "$NONINTERACTIVE" ]]; then
@@ -386,6 +545,9 @@ main() {
     unpack_oci_image
     get_oci_config
 
+    # Prompt for environment variables
+    prompt_env_vars
+
     # Create template and container
     create_template "$CT_NAME"
     create_container "$CT_NAME"
@@ -411,6 +573,15 @@ main() {
     msg "  pct stop ${CTID}     # Stop container"
     msg "  pct start ${CTID}    # Start container"
     echo ""
+
+    # Offer to save config (skip in non-interactive mode)
+    if [[ -z "$NONINTERACTIVE" ]]; then
+        if whiptail --backtitle "OCI-to-LXC" \
+            --title "Save Configuration" \
+            --yesno "Save this configuration for future use?" 8 50; then
+            save_config "$CT_NAME"
+        fi
+    fi
 }
 
 main "$@"
