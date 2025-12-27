@@ -18,7 +18,7 @@ set -Eeuo pipefail
 # CONFIGURATION
 # =============================================================================
 
-SCRIPT_VERSION="1.0.5"
+SCRIPT_VERSION="1.0.6"
 OCI_IMAGE="${OCI_IMAGE:-}"
 CT_NAME="${CT_NAME:-}"
 CT_MEMORY="${CT_MEMORY:-256}"
@@ -559,13 +559,14 @@ main() {
     select_storage "rootdir" "CT_STORAGE"
     select_storage "vztmpl" "TEMPLATE_STORAGE"
 
+    # Prompt for environment variables BEFORE pulling image
+    echo ""
+    prompt_env_vars
+
     # Pull and unpack image
     pull_oci_image "$OCI_IMAGE"
     unpack_oci_image
     get_oci_config
-
-    # Prompt for environment variables
-    prompt_env_vars
 
     # Create template and container
     create_template "$CT_NAME"
