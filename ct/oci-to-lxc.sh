@@ -18,7 +18,7 @@ set -Eeuo pipefail
 # CONFIGURATION
 # =============================================================================
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.2"
 OCI_IMAGE="${OCI_IMAGE:-}"
 CT_NAME="${CT_NAME:-}"
 CT_MEMORY="${CT_MEMORY:-256}"
@@ -27,6 +27,10 @@ CT_DISK="${CT_DISK:-1}"
 CT_BRIDGE="${CT_BRIDGE:-}"
 CT_STORAGE="${CT_STORAGE:-}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-}"
+NONINTERACTIVE="${NONINTERACTIVE:-}"
+
+# Auto-enable non-interactive if no TTY
+[[ ! -t 0 ]] && NONINTERACTIVE=1
 
 # Colors
 RD=$(echo "\033[01;31m")
@@ -101,6 +105,8 @@ check_deps() {
 # =============================================================================
 
 select_bridge() {
+    [[ -n "$CT_BRIDGE" ]] && { msg_ok "Using bridge: ${CT_BRIDGE}"; return; }
+
     msg_info "Detecting network bridges"
     local bridge_list
     bridge_list=$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort)
@@ -113,7 +119,7 @@ select_bridge() {
     local count
     count=$(echo "$bridge_list" | wc -l)
 
-    if [[ $count -eq 1 ]]; then
+    if [[ $count -eq 1 ]] || [[ -n "$NONINTERACTIVE" ]]; then
         CT_BRIDGE=$(echo "$bridge_list" | head -1)
         msg_ok "Using bridge: ${CT_BRIDGE}"
     else
@@ -137,6 +143,9 @@ select_storage() {
     local content_type="$1"
     local var_name="$2"
 
+    # Skip if already set
+    [[ -n "${!var_name}" ]] && { msg_ok "Using ${content_type} storage: ${!var_name}"; return; }
+
     msg_info "Detecting ${content_type} storage"
     local storage_list
     storage_list=$(pvesm status -content "$content_type" 2>/dev/null | awk 'NR>1 {print $1}' | sort)
@@ -149,7 +158,7 @@ select_storage() {
     local count
     count=$(echo "$storage_list" | wc -l)
 
-    if [[ $count -eq 1 ]]; then
+    if [[ $count -eq 1 ]] || [[ -n "$NONINTERACTIVE" ]]; then
         eval "$var_name=$(echo "$storage_list" | head -1)"
         msg_ok "Using ${content_type} storage: ${!var_name}"
     else
@@ -317,6 +326,10 @@ main() {
 
     # Get OCI image
     if [[ -z "$OCI_IMAGE" ]]; then
+        if [[ -n "$NONINTERACTIVE" ]]; then
+            msg_error "OCI_IMAGE must be set in non-interactive mode"
+            exit 1
+        fi
         OCI_IMAGE=$(whiptail --backtitle "OCI-to-LXC" \
             --title "OCI Image" \
             --inputbox "Enter Docker/OCI image (e.g., nginx:alpine, fosrl/newt:latest):" \
@@ -340,12 +353,14 @@ main() {
     msg "  Disk:     ${CT_DISK}GB"
     echo ""
 
-    # Confirm
-    if ! whiptail --backtitle "OCI-to-LXC" \
-        --title "Confirm" \
-        --yesno "Create LXC from this OCI image?" 10 60; then
-        msg "Cancelled"
-        exit 0
+    # Confirm (skip in non-interactive mode)
+    if [[ -z "$NONINTERACTIVE" ]]; then
+        if ! whiptail --backtitle "OCI-to-LXC" \
+            --title "Confirm" \
+            --yesno "Create LXC from this OCI image?" 10 60; then
+            msg "Cancelled"
+            exit 0
+        fi
     fi
 
     # Select resources
