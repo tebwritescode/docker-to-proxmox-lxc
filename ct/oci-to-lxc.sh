@@ -18,7 +18,7 @@ set -Eeuo pipefail
 # CONFIGURATION
 # =============================================================================
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 OCI_IMAGE="${OCI_IMAGE:-}"
 CT_NAME="${CT_NAME:-}"
 CT_MEMORY="${CT_MEMORY:-256}"
@@ -219,8 +219,12 @@ get_oci_config() {
     if [[ -f "$config_file" ]]; then
         OCI_CMD=$(jq -r '.process.args | join(" ")' "$config_file" 2>/dev/null || echo "")
         OCI_WORKDIR=$(jq -r '.process.cwd // "/"' "$config_file" 2>/dev/null || echo "/")
+        OCI_PATH=$(jq -r '.process.env[]? | select(startswith("PATH="))' "$config_file" 2>/dev/null | head -1 || echo "")
         OCI_ENV=$(jq -r '.process.env[]? | select(startswith("PATH=") | not)' "$config_file" 2>/dev/null | head -20 || echo "")
     fi
+
+    # Default PATH if not found
+    [[ -z "$OCI_PATH" ]] && OCI_PATH="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
     msg_ok "Extracted config: ${OCI_CMD:-/bin/sh}"
 }
@@ -233,14 +237,23 @@ create_template() {
     local rootfs="${WORK_DIR}/bundle/rootfs"
     local template_path="/var/lib/vz/template/cache/${template_name}.tar.gz"
 
+    # Create startup wrapper script with proper PATH
+    cat > "${rootfs}/etc/oci-start.sh" << EOFWRAPPER
+#!/bin/sh
+export ${OCI_PATH}
+cd ${OCI_WORKDIR}
+exec ${OCI_CMD:-/bin/sh}
+EOFWRAPPER
+    chmod +x "${rootfs}/etc/oci-start.sh"
+
     # Create minimal inittab for running the OCI command
     cat > "${rootfs}/etc/inittab" << EOF
 # Minimal inittab for OCI container
 ::sysinit:/bin/hostname -F /etc/hostname
 ::sysinit:/sbin/ifup -a 2>/dev/null || true
 
-# Run the main application
-::respawn:${OCI_CMD:-/bin/sh}
+# Run the main application via wrapper
+::respawn:/etc/oci-start.sh
 
 # Shutdown handling
 ::ctrlaltdel:/sbin/reboot
