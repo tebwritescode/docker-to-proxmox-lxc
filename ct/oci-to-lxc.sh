@@ -18,7 +18,7 @@ set -Eeuo pipefail
 # CONFIGURATION
 # =============================================================================
 
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.0.5"
 OCI_IMAGE="${OCI_IMAGE:-}"
 CT_NAME="${CT_NAME:-}"
 CT_MEMORY="${CT_MEMORY:-256}"
@@ -209,40 +209,59 @@ select_config() {
 # =============================================================================
 
 prompt_env_vars() {
-    # OCI_ENV contains environment variables from the image (excluding PATH)
-    [[ -z "$OCI_ENV" ]] && return 0
-
     if [[ -n "$NONINTERACTIVE" ]]; then
-        # In non-interactive mode, use defaults or pre-set values
+        # In non-interactive mode, use pre-set values only
         return 0
     fi
 
-    msg "Environment variables from image:"
+    # Show existing env vars from config if any
+    if [[ ${#USER_ENV_VARS[@]} -gt 0 ]]; then
+        msg "Environment variables from config:"
+        for key in "${!USER_ENV_VARS[@]}"; do
+            msg "  ${key}=${USER_ENV_VARS[$key]}"
+        done
+        echo ""
+    fi
 
-    while IFS= read -r env_line; do
-        [[ -z "$env_line" ]] && continue
+    # Ask if user wants to configure environment variables
+    if ! whiptail --backtitle "OCI-to-LXC" \
+        --title "Environment Variables" \
+        --yesno "Configure environment variables for this container?\n\n(Many Docker images require configuration like API keys, endpoints, etc.)" 10 70; then
+        return 0
+    fi
 
-        local env_name="${env_line%%=*}"
-        local env_default="${env_line#*=}"
+    # Loop to add environment variables
+    while true; do
+        local env_input
+        env_input=$(whiptail --backtitle "OCI-to-LXC" \
+            --title "Add Environment Variable" \
+            --inputbox "Enter environment variable (NAME=value format):\n\nExamples:\n  PANGOLIN_ENDPOINT=https://example.com\n  API_KEY=your-key-here\n\nLeave empty when done adding variables." \
+            14 70 "" 3>&1 1>&2 2>&3) || break
 
-        # Skip if already set from config
-        if [[ -n "${USER_ENV_VARS[$env_name]:-}" ]]; then
-            msg "  ${env_name}=${USER_ENV_VARS[$env_name]} (from config)"
-            continue
-        fi
+        # Empty input means done
+        [[ -z "$env_input" ]] && break
 
-        local user_value
-        user_value=$(whiptail --backtitle "OCI-to-LXC" \
-            --title "Environment Variable" \
-            --inputbox "${env_name}\n\nDefault: ${env_default}\n\nEnter value (or leave empty for default):" \
-            12 70 "" 3>&1 1>&2 2>&3) || true
-
-        if [[ -n "$user_value" ]]; then
-            USER_ENV_VARS["$env_name"]="$user_value"
+        # Validate format
+        if [[ "$env_input" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            local env_name="${BASH_REMATCH[1]}"
+            local env_value="${BASH_REMATCH[2]}"
+            USER_ENV_VARS["$env_name"]="$env_value"
+            msg_ok "Added: ${env_name}=${env_value}"
         else
-            USER_ENV_VARS["$env_name"]="$env_default"
+            whiptail --backtitle "OCI-to-LXC" \
+                --title "Invalid Format" \
+                --msgbox "Invalid format. Use NAME=value format.\n\nVariable names must start with a letter or underscore." 10 60
         fi
-    done <<< "$OCI_ENV"
+    done
+
+    # Show summary
+    if [[ ${#USER_ENV_VARS[@]} -gt 0 ]]; then
+        echo ""
+        msg "Configured environment variables:"
+        for key in "${!USER_ENV_VARS[@]}"; do
+            msg "  ${key}=${USER_ENV_VARS[$key]}"
+        done
+    fi
 }
 
 # =============================================================================
