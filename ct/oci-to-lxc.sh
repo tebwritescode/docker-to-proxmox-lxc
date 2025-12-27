@@ -18,7 +18,7 @@ set -Eeuo pipefail
 # CONFIGURATION
 # =============================================================================
 
-SCRIPT_VERSION="1.0.7"
+SCRIPT_VERSION="1.0.8"
 OCI_IMAGE="${OCI_IMAGE:-}"
 CT_NAME="${CT_NAME:-}"
 CT_MEMORY="${CT_MEMORY:-256}"
@@ -598,10 +598,27 @@ main() {
     msg "  Image:   ${OCI_IMAGE}"
     msg "  Command: ${OCI_CMD:-/bin/sh}"
     echo ""
+
+    # Check for listening ports (wait a moment for services to start)
+    sleep 3
+    local ports
+    ports=$(pct exec "$CTID" -- sh -c "netstat -tlnp 2>/dev/null | grep LISTEN | awk '{print \$4}' | sed 's/.*://' | sort -u | tr '\n' ' '" 2>/dev/null || \
+            pct exec "$CTID" -- sh -c "ss -tlnp 2>/dev/null | grep LISTEN | awk '{print \$4}' | sed 's/.*://' | sort -u | tr '\n' ' '" 2>/dev/null || \
+            echo "")
+
+    if [[ -n "$ports" && "$ports" != " " ]]; then
+        msg "Exposed Services:"
+        for port in $ports; do
+            msg "  http://${ip}:${port}"
+        done
+        echo ""
+    fi
+
     msg "Management:"
     msg "  pct enter ${CTID}    # Shell access"
     msg "  pct stop ${CTID}     # Stop container"
     msg "  pct start ${CTID}    # Start container"
+    msg "  pct exec ${CTID} -- netstat -tlnp   # Check listening ports"
     echo ""
 
     # Offer to save config (skip in non-interactive mode)
