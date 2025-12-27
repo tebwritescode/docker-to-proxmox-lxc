@@ -18,7 +18,7 @@ set -Eeuo pipefail
 # CONFIGURATION
 # =============================================================================
 
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.7"
 OCI_IMAGE="${OCI_IMAGE:-}"
 CT_NAME="${CT_NAME:-}"
 CT_MEMORY="${CT_MEMORY:-256}"
@@ -34,7 +34,7 @@ CONFIG_FILE="${CONFIG_FILE:-}"
 CONFIG_DIR="/etc/oci-to-lxc"
 
 # User-defined environment variables (populated during setup)
-declare -A USER_ENV_VARS
+declare -A USER_ENV_VARS=()  # Initialize empty associative array
 
 # Auto-enable non-interactive if no TTY
 [[ ! -t 0 ]] && NONINTERACTIVE=1
@@ -163,9 +163,11 @@ TEMPLATE_STORAGE="${TEMPLATE_STORAGE}"
 EOF
 
     # Save environment variables
+    set +u
     for key in "${!USER_ENV_VARS[@]}"; do
         echo "ENV_${key}=\"${USER_ENV_VARS[$key]}\"" >> "$config_file"
     done
+    set -u
 
     msg_ok "Config saved: ${config_file}"
 }
@@ -215,7 +217,10 @@ prompt_env_vars() {
     fi
 
     # Show existing env vars from config if any
-    if [[ ${#USER_ENV_VARS[@]} -gt 0 ]]; then
+    set +u  # Temporarily disable unbound variable check for array
+    local env_count=${#USER_ENV_VARS[@]}
+    set -u
+    if [[ $env_count -gt 0 ]]; then
         msg "Environment variables from config:"
         for key in "${!USER_ENV_VARS[@]}"; do
             msg "  ${key}=${USER_ENV_VARS[$key]}"
@@ -255,7 +260,10 @@ prompt_env_vars() {
     done
 
     # Show summary
-    if [[ ${#USER_ENV_VARS[@]} -gt 0 ]]; then
+    set +u
+    env_count=${#USER_ENV_VARS[@]}
+    set -u
+    if [[ $env_count -gt 0 ]]; then
         echo ""
         msg "Configured environment variables:"
         for key in "${!USER_ENV_VARS[@]}"; do
@@ -407,9 +415,11 @@ create_template() {
         echo "export ${OCI_PATH}"
 
         # Add user-defined environment variables
+        set +u
         for key in "${!USER_ENV_VARS[@]}"; do
             echo "export ${key}=\"${USER_ENV_VARS[$key]}\""
         done
+        set -u
 
         echo "cd ${OCI_WORKDIR}"
         echo "exec ${OCI_CMD:-/bin/sh}"
