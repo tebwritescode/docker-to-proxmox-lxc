@@ -148,8 +148,8 @@ systemctl enable docker >/dev/null 2>&1
 systemctl start docker
 
 # Wait for Docker to be ready
-local max_wait=30
-local waited=0
+max_wait=30
+waited=0
 while ! docker info >/dev/null 2>&1; do
     sleep 1
     ((waited++))
