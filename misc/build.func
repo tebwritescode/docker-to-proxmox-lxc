@@ -1,0 +1,797 @@
+#!/usr/bin/env bash
+
+# Docker-to-LXC Build Framework
+# Inspired by Proxmox VE Community Helper Scripts
+# https://github.com/community-scripts/ProxmoxVE
+
+# Copyright (c) 2024
+# License: MIT
+
+set -Eeuo pipefail
+
+# =============================================================================
+# GLOBAL VARIABLES
+# =============================================================================
+
+# Script metadata
+SCRIPT_VERSION="1.0.3"
+SCRIPT_REPO="https://github.com/tebwritescode/docker-to-proxmox-lxc"
+
+# Colors for output
+RD=$(echo "\033[01;31m")
+YW=$(echo "\033[33m")
+GN=$(echo "\033[1;32m")
+CL=$(echo "\033[m")
+BL=$(echo "\033[36m")
+CM="${GN}✓${CL}"
+CROSS="${RD}✗${CL}"
+INFO="${BL}ℹ${CL}"
+
+# Default container settings
+var_cpu="${var_cpu:-2}"
+var_ram="${var_ram:-2048}"
+var_disk="${var_disk:-8}"
+var_os="${var_os:-debian}"
+var_version="${var_version:-12}"
+var_unprivileged="${var_unprivileged:-1}"
+var_start="${var_start:-1}"
+var_verbose="${var_verbose:-no}"
+
+# Container type (0=privileged, 1=unprivileged)
+CT_TYPE="${CT_TYPE:-1}"
+
+# Network defaults
+NET_TYPE="${NET_TYPE:-dhcp}"
+BRIDGE="${BRIDGE:-}"
+STATIC_IP="${STATIC_IP:-}"
+GATEWAY="${GATEWAY:-}"
+VLAN="${VLAN:-}"
+MTU="${MTU:-}"
+
+# SSH settings
+SSH_AUTHORIZED_KEY="${SSH_AUTHORIZED_KEY:-}"
+SSH_ROOT_PASSWORD="${SSH_ROOT_PASSWORD:-}"
+
+# Docker service settings
+DOCKER_IMAGE="${DOCKER_IMAGE:-}"
+DOCKER_PORTS="${DOCKER_PORTS:-}"
+DOCKER_VOLUMES="${DOCKER_VOLUMES:-}"
+DOCKER_ENV="${DOCKER_ENV:-}"
+DOCKER_RESTART="${DOCKER_RESTART:-unless-stopped}"
+DOCKER_EXTRA_ARGS="${DOCKER_EXTRA_ARGS:-}"
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+msg_info() {
+    local msg="$1"
+    echo -ne " ${INFO} ${YW}${msg}...${CL}"
+}
+
+msg_ok() {
+    local msg="$1"
+    echo -e "\r ${CM} ${GN}${msg}${CL}"
+}
+
+msg_error() {
+    local msg="$1"
+    echo -e "\r ${CROSS} ${RD}${msg}${CL}"
+}
+
+msg() {
+    local msg="$1"
+    echo -e " ${msg}"
+}
+
+header_info() {
+    clear
+    cat <<"EOF"
+    ____             __                   __           __   _  ________
+   / __ \____  _____/ /_____  _____      / /_____     / /  | |/ / ____/
+  / / / / __ \/ ___/ //_/ _ \/ ___/_____/ __/ __ \   / /   |   / /
+ / /_/ / /_/ / /__/ ,< /  __/ /  /_____/ /_/ /_/ /  / /___/   / /___
+/_____/\____/\___/_/|_|\___/_/         \__/\____/  /_____/_/|_\____/
+
+EOF
+    echo -e "${BL}Docker Image to Proxmox LXC Service${CL}"
+    echo -e "${YW}Version: ${SCRIPT_VERSION}${CL}\n"
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        msg_error "This script must be run as root"
+        exit 1
+    fi
+}
+
+check_pve() {
+    if ! command -v pveversion &>/dev/null; then
+        msg_error "This script must be run on a Proxmox VE host"
+        exit 1
+    fi
+
+    PVEVERSION=$(pveversion --verbose | grep pve-manager | awk '{print $2}' | cut -d'/' -f1)
+    msg_ok "Proxmox VE ${PVEVERSION} detected"
+}
+
+# =============================================================================
+# STORAGE FUNCTIONS
+# =============================================================================
+
+select_storage() {
+    local storage_type="$1"  # "rootdir" or "images"
+    local storage_list
+
+    msg_info "Detecting available storage"
+
+    # Get list of storages that support the content type
+    if [[ "$storage_type" == "rootdir" ]]; then
+        storage_list=$(pvesm status -content rootdir 2>/dev/null | awk 'NR>1 {print $1}' | sort)
+    else
+        storage_list=$(pvesm status -content images 2>/dev/null | awk 'NR>1 {print $1}' | sort)
+    fi
+
+    if [[ -z "$storage_list" ]]; then
+        msg_error "No storage available for ${storage_type}"
+        exit 1
+    fi
+
+    # Count available storages
+    local count
+    count=$(echo "$storage_list" | wc -l)
+
+    if [[ $count -eq 1 ]]; then
+        STORAGE=$(echo "$storage_list" | head -1)
+        msg_ok "Using storage: ${STORAGE}"
+    else
+        # Interactive selection using whiptail
+        local options=()
+        while IFS= read -r storage; do
+            local storage_info
+            storage_info=$(pvesm status | grep "^${storage}" | awk '{print $3"/"$4}')
+            options+=("$storage" "$storage_info" "OFF")
+        done <<< "$storage_list"
+
+        # Set first option as default
+        options[2]="ON"
+
+        STORAGE=$(whiptail --backtitle "Docker-to-LXC" \
+            --title "Storage Selection" \
+            --radiolist "Select storage for container ${storage_type}:" \
+            16 60 8 \
+            "${options[@]}" \
+            3>&1 1>&2 2>&3) || exit 1
+
+        msg_ok "Selected storage: ${STORAGE}"
+    fi
+}
+
+# =============================================================================
+# TEMPLATE FUNCTIONS
+# =============================================================================
+
+select_bridge() {
+    msg_info "Detecting network bridges"
+
+    # Get list of bridges
+    local bridge_list
+    bridge_list=$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort)
+
+    if [[ -z "$bridge_list" ]]; then
+        msg_error "No network bridges found"
+        exit 1
+    fi
+
+    # Count available bridges
+    local count
+    count=$(echo "$bridge_list" | wc -l)
+
+    if [[ $count -eq 1 ]]; then
+        BRIDGE=$(echo "$bridge_list" | head -1)
+        msg_ok "Using bridge: ${BRIDGE}"
+    else
+        # Interactive selection using whiptail
+        local options=()
+        while IFS= read -r bridge; do
+            local bridge_ip
+            bridge_ip=$(ip -4 addr show "$bridge" 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1)
+            options+=("$bridge" "${bridge_ip:-no IP}" "OFF")
+        done <<< "$bridge_list"
+
+        # Set first option as default
+        options[2]="ON"
+
+        BRIDGE=$(whiptail --backtitle "Docker-to-LXC" \
+            --title "Network Bridge Selection" \
+            --radiolist "Select network bridge:" \
+            16 60 8 \
+            "${options[@]}" \
+            3>&1 1>&2 2>&3) || exit 1
+
+        msg_ok "Selected bridge: ${BRIDGE}"
+    fi
+}
+
+select_template_storage() {
+    msg_info "Detecting template storage"
+
+    # Get list of storages that support vztmpl content type
+    local storage_list
+    storage_list=$(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 {print $1}' | sort)
+
+    if [[ -z "$storage_list" ]]; then
+        msg_error "No storage available for templates (vztmpl)"
+        exit 1
+    fi
+
+    # Count available storages
+    local count
+    count=$(echo "$storage_list" | wc -l)
+
+    if [[ $count -eq 1 ]]; then
+        TEMPLATE_STORAGE=$(echo "$storage_list" | head -1)
+        msg_ok "Using template storage: ${TEMPLATE_STORAGE}"
+    else
+        # Interactive selection using whiptail
+        local options=()
+        while IFS= read -r storage; do
+            local storage_info
+            storage_info=$(pvesm status | grep "^${storage}" | awk '{print $3"/"$4}')
+            options+=("$storage" "$storage_info" "OFF")
+        done <<< "$storage_list"
+
+        # Set first option as default
+        options[2]="ON"
+
+        TEMPLATE_STORAGE=$(whiptail --backtitle "Docker-to-LXC" \
+            --title "Template Storage Selection" \
+            --radiolist "Select storage for templates:" \
+            16 60 8 \
+            "${options[@]}" \
+            3>&1 1>&2 2>&3) || exit 1
+
+        msg_ok "Selected template storage: ${TEMPLATE_STORAGE}"
+    fi
+}
+
+get_template() {
+    local os="$1"
+    local version="$2"
+
+    msg_info "Fetching ${os} ${version} template"
+
+    # Update template list
+    pveam update >/dev/null 2>&1
+
+    # Find matching template
+    local template
+    template=$(pveam available -section system | grep -i "${os}-${version}" | head -1 | awk '{print $2}')
+
+    if [[ -z "$template" ]]; then
+        # Try alternative naming
+        template=$(pveam available -section system | grep -i "${os}" | grep "${version}" | head -1 | awk '{print $2}')
+    fi
+
+    if [[ -z "$template" ]]; then
+        msg_error "Template for ${os} ${version} not found"
+        echo ""
+        msg "Available templates:"
+        pveam available -section system | grep -i "${os}" | awk '{print "  - "$2}'
+        exit 1
+    fi
+
+    TEMPLATE="$template"
+    msg_ok "Found template: ${TEMPLATE}"
+
+    # Check if template exists on any storage that supports vztmpl
+    local template_found=false
+    local vztmpl_storages
+    vztmpl_storages=$(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 {print $1}')
+
+    for store in $vztmpl_storages; do
+        if pveam list "$store" 2>/dev/null | grep -q "$TEMPLATE"; then
+            TEMPLATE_STORAGE="$store"
+            template_found=true
+            msg_ok "Template already available on ${TEMPLATE_STORAGE}"
+            break
+        fi
+    done
+
+    # Download template if not present
+    if [[ "$template_found" != "true" ]]; then
+        msg_info "Downloading template ${TEMPLATE} to ${TEMPLATE_STORAGE}"
+        if ! pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" >/dev/null 2>&1; then
+            msg_error "Failed to download template"
+            exit 1
+        fi
+        msg_ok "Template downloaded"
+    fi
+}
+
+# =============================================================================
+# CONTAINER FUNCTIONS
+# =============================================================================
+
+get_next_ctid() {
+    pvesh get /cluster/nextid 2>/dev/null || echo "100"
+}
+
+sanitize_name() {
+    local name="$1"
+    # Remove docker registry prefix, convert to lowercase, replace invalid chars
+    echo "$name" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//'
+}
+
+build_container() {
+    local ct_name="$1"
+
+    CTID=$(get_next_ctid)
+
+    msg_info "Creating LXC container ${ct_name} (ID: ${CTID})"
+
+    # Build network string
+    local net_config="name=eth0,bridge=${BRIDGE}"
+
+    if [[ "$NET_TYPE" == "dhcp" ]]; then
+        net_config+=",ip=dhcp"
+    else
+        net_config+=",ip=${STATIC_IP}"
+        [[ -n "$GATEWAY" ]] && net_config+=",gw=${GATEWAY}"
+    fi
+
+    [[ -n "$VLAN" ]] && net_config+=",tag=${VLAN}"
+    [[ -n "$MTU" ]] && net_config+=",mtu=${MTU}"
+
+    # Build features string for Docker support
+    local features="nesting=1"
+
+    # Handle keyctl for unprivileged containers
+    if [[ "$CT_TYPE" -eq 1 ]]; then
+        features+=",keyctl=1"
+    fi
+
+    # Create container
+    # Use TEMPLATE_STORAGE for the template and STORAGE for rootfs
+    local pct_cmd=(
+        pct create "$CTID"
+        "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}"
+        -hostname "$ct_name"
+        -cores "$var_cpu"
+        -memory "$var_ram"
+        -rootfs "${STORAGE}:${var_disk}"
+        -net0 "$net_config"
+        -features "$features"
+        -onboot 1
+        -unprivileged "$CT_TYPE"
+    )
+
+    # Add password if set
+    if [[ -n "$SSH_ROOT_PASSWORD" ]]; then
+        pct_cmd+=(-password "$SSH_ROOT_PASSWORD")
+    fi
+
+    # Add SSH key if set
+    if [[ -n "$SSH_AUTHORIZED_KEY" ]]; then
+        local keyfile="/tmp/ssh_key_${CTID}.pub"
+        echo "$SSH_AUTHORIZED_KEY" > "$keyfile"
+        pct_cmd+=(-ssh-public-keys "$keyfile")
+    fi
+
+    # Execute container creation
+    "${pct_cmd[@]}" >/dev/null 2>&1
+
+    # Cleanup temp ssh key file
+    [[ -f "/tmp/ssh_key_${CTID}.pub" ]] && rm -f "/tmp/ssh_key_${CTID}.pub"
+
+    msg_ok "Container ${ct_name} created (ID: ${CTID})"
+
+    # Start container
+    msg_info "Starting container"
+    pct start "$CTID" >/dev/null 2>&1
+
+    # Wait for container to be ready
+    local max_wait=30
+    local waited=0
+    while [[ $waited -lt $max_wait ]]; do
+        if pct exec "$CTID" -- test -f /etc/os-release 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        ((waited++))
+    done
+
+    if [[ $waited -ge $max_wait ]]; then
+        msg_error "Container failed to start properly"
+        exit 1
+    fi
+
+    msg_ok "Container started"
+}
+
+# =============================================================================
+# INSTALLATION FUNCTIONS
+# =============================================================================
+
+run_install_script() {
+    local script_url="$1"
+
+    msg_info "Running installation script in container"
+
+    # Download and execute install script
+    pct exec "$CTID" -- bash -c "
+        apt-get update >/dev/null 2>&1
+        apt-get install -y curl >/dev/null 2>&1
+        curl -fsSL '${script_url}' | bash -s -- \
+            '${DOCKER_IMAGE}' \
+            '${DOCKER_PORTS}' \
+            '${DOCKER_VOLUMES}' \
+            '${DOCKER_ENV}' \
+            '${DOCKER_RESTART}' \
+            '${DOCKER_EXTRA_ARGS}'
+    "
+
+    msg_ok "Installation complete"
+}
+
+run_install_script_local() {
+    local script_path="$1"
+
+    msg_info "Running installation script in container"
+
+    # Copy script to container and execute
+    local tmp_script="/tmp/install_${CTID}.sh"
+    pct push "$CTID" "$script_path" "$tmp_script"
+
+    pct exec "$CTID" -- bash -c "
+        chmod +x '$tmp_script'
+        '$tmp_script' \
+            '${DOCKER_IMAGE}' \
+            '${DOCKER_PORTS}' \
+            '${DOCKER_VOLUMES}' \
+            '${DOCKER_ENV}' \
+            '${DOCKER_RESTART}' \
+            '${DOCKER_EXTRA_ARGS}'
+        rm -f '$tmp_script'
+    "
+
+    msg_ok "Installation complete"
+}
+
+# =============================================================================
+# CONFIGURATION FUNCTIONS
+# =============================================================================
+
+load_config() {
+    local config_file="$1"
+
+    if [[ -f "$config_file" ]]; then
+        msg_info "Loading configuration from ${config_file}"
+        # Source config file (only whitelisted variables)
+        while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            [[ -z "$key" || "$key" =~ ^# ]] && continue
+            # Remove quotes from value
+            value="${value%\"}"
+            value="${value#\"}"
+            value="${value%\'}"
+            value="${value#\'}"
+            # Export whitelisted variables
+            case "$key" in
+                var_cpu|var_ram|var_disk|var_os|var_version|var_unprivileged)
+                    export "$key=$value"
+                    ;;
+                DOCKER_IMAGE|DOCKER_PORTS|DOCKER_VOLUMES|DOCKER_ENV|DOCKER_RESTART|DOCKER_EXTRA_ARGS)
+                    export "$key=$value"
+                    ;;
+                NET_TYPE|STATIC_IP|GATEWAY|VLAN|MTU)
+                    export "$key=$value"
+                    ;;
+                CT_TYPE|SSH_AUTHORIZED_KEY|SSH_ROOT_PASSWORD)
+                    export "$key=$value"
+                    ;;
+            esac
+        done < "$config_file"
+        msg_ok "Configuration loaded"
+    fi
+}
+
+# =============================================================================
+# INTERACTIVE MENU FUNCTIONS
+# =============================================================================
+
+default_settings() {
+    msg "Using default settings:"
+    msg "  OS:         ${var_os} ${var_version}"
+    msg "  CPU:        ${var_cpu} cores"
+    msg "  RAM:        ${var_ram} MB"
+    msg "  Disk:       ${var_disk} GB"
+    msg "  Network:    DHCP"
+    msg "  Container:  $([ "$CT_TYPE" -eq 1 ] && echo 'Unprivileged' || echo 'Privileged')"
+    echo ""
+}
+
+advanced_settings() {
+    # Container type
+    CT_TYPE=$(whiptail --backtitle "Docker-to-LXC" \
+        --title "Container Type" \
+        --radiolist "Select container type:" 12 60 2 \
+        "1" "Unprivileged (Recommended)" ON \
+        "0" "Privileged" OFF \
+        3>&1 1>&2 2>&3) || exit 1
+
+    # OS Selection
+    var_os=$(whiptail --backtitle "Docker-to-LXC" \
+        --title "Operating System" \
+        --radiolist "Select OS:" 14 60 4 \
+        "debian" "Debian" ON \
+        "ubuntu" "Ubuntu" OFF \
+        "alpine" "Alpine Linux" OFF \
+        3>&1 1>&2 2>&3) || exit 1
+
+    # Version selection based on OS
+    case "$var_os" in
+        debian)
+            var_version=$(whiptail --backtitle "Docker-to-LXC" \
+                --title "Debian Version" \
+                --radiolist "Select version:" 14 60 4 \
+                "12" "Bookworm (Recommended)" ON \
+                "11" "Bullseye" OFF \
+                3>&1 1>&2 2>&3) || exit 1
+            ;;
+        ubuntu)
+            var_version=$(whiptail --backtitle "Docker-to-LXC" \
+                --title "Ubuntu Version" \
+                --radiolist "Select version:" 14 60 4 \
+                "24.04" "Noble (24.04 LTS)" ON \
+                "22.04" "Jammy (22.04 LTS)" OFF \
+                3>&1 1>&2 2>&3) || exit 1
+            ;;
+        alpine)
+            var_version=$(whiptail --backtitle "Docker-to-LXC" \
+                --title "Alpine Version" \
+                --radiolist "Select version:" 14 60 4 \
+                "3.19" "Alpine 3.19" ON \
+                "3.18" "Alpine 3.18" OFF \
+                3>&1 1>&2 2>&3) || exit 1
+            ;;
+    esac
+
+    # CPU cores
+    var_cpu=$(whiptail --backtitle "Docker-to-LXC" \
+        --title "CPU Cores" \
+        --inputbox "Number of CPU cores:" 10 60 "$var_cpu" \
+        3>&1 1>&2 2>&3) || exit 1
+
+    # RAM
+    var_ram=$(whiptail --backtitle "Docker-to-LXC" \
+        --title "Memory" \
+        --inputbox "Memory in MB:" 10 60 "$var_ram" \
+        3>&1 1>&2 2>&3) || exit 1
+
+    # Disk
+    var_disk=$(whiptail --backtitle "Docker-to-LXC" \
+        --title "Disk Size" \
+        --inputbox "Disk size in GB:" 10 60 "$var_disk" \
+        3>&1 1>&2 2>&3) || exit 1
+
+    # Network type
+    NET_TYPE=$(whiptail --backtitle "Docker-to-LXC" \
+        --title "Network Configuration" \
+        --radiolist "Select network type:" 12 60 2 \
+        "dhcp" "DHCP (Automatic)" ON \
+        "static" "Static IP" OFF \
+        3>&1 1>&2 2>&3) || exit 1
+
+    if [[ "$NET_TYPE" == "static" ]]; then
+        STATIC_IP=$(whiptail --backtitle "Docker-to-LXC" \
+            --title "Static IP" \
+            --inputbox "Enter IP address (e.g., 192.168.1.100/24):" 10 60 \
+            3>&1 1>&2 2>&3) || exit 1
+
+        GATEWAY=$(whiptail --backtitle "Docker-to-LXC" \
+            --title "Gateway" \
+            --inputbox "Enter gateway (e.g., 192.168.1.1):" 10 60 \
+            3>&1 1>&2 2>&3) || exit 1
+    fi
+
+    # Optional VLAN
+    if whiptail --backtitle "Docker-to-LXC" \
+        --title "VLAN" \
+        --yesno "Configure VLAN tagging?" 10 60; then
+        VLAN=$(whiptail --backtitle "Docker-to-LXC" \
+            --title "VLAN ID" \
+            --inputbox "Enter VLAN ID:" 10 60 \
+            3>&1 1>&2 2>&3) || exit 1
+    fi
+
+    # Root password
+    if whiptail --backtitle "Docker-to-LXC" \
+        --title "Root Password" \
+        --yesno "Set root password?" 10 60; then
+        SSH_ROOT_PASSWORD=$(whiptail --backtitle "Docker-to-LXC" \
+            --title "Root Password" \
+            --passwordbox "Enter root password:" 10 60 \
+            3>&1 1>&2 2>&3) || exit 1
+    fi
+
+    msg_ok "Advanced settings configured"
+}
+
+docker_settings() {
+    # Docker image (if not already set)
+    if [[ -z "$DOCKER_IMAGE" ]]; then
+        DOCKER_IMAGE=$(whiptail --backtitle "Docker-to-LXC" \
+            --title "Docker Image" \
+            --inputbox "Enter Docker image (e.g., nginx:latest, hello-world):" 10 70 \
+            3>&1 1>&2 2>&3) || exit 1
+    fi
+
+    if [[ -z "$DOCKER_IMAGE" ]]; then
+        msg_error "Docker image is required"
+        exit 1
+    fi
+
+    # Port mappings
+    if whiptail --backtitle "Docker-to-LXC" \
+        --title "Port Mappings" \
+        --yesno "Configure port mappings?" 10 60; then
+        DOCKER_PORTS=$(whiptail --backtitle "Docker-to-LXC" \
+            --title "Port Mappings" \
+            --inputbox "Enter port mappings (e.g., 80:80,443:443):" 10 70 \
+            3>&1 1>&2 2>&3) || exit 1
+    fi
+
+    # Volume mounts
+    if whiptail --backtitle "Docker-to-LXC" \
+        --title "Volume Mounts" \
+        --yesno "Configure volume mounts?" 10 60; then
+        DOCKER_VOLUMES=$(whiptail --backtitle "Docker-to-LXC" \
+            --title "Volume Mounts" \
+            --inputbox "Enter volume mounts (e.g., /data:/app/data,/config:/app/config):" 10 70 \
+            3>&1 1>&2 2>&3) || exit 1
+    fi
+
+    # Environment variables
+    if whiptail --backtitle "Docker-to-LXC" \
+        --title "Environment Variables" \
+        --yesno "Configure environment variables?" 10 60; then
+        DOCKER_ENV=$(whiptail --backtitle "Docker-to-LXC" \
+            --title "Environment Variables" \
+            --inputbox "Enter environment variables (e.g., VAR1=value1,VAR2=value2):" 10 70 \
+            3>&1 1>&2 2>&3) || exit 1
+    fi
+
+    # Restart policy
+    DOCKER_RESTART=$(whiptail --backtitle "Docker-to-LXC" \
+        --title "Restart Policy" \
+        --radiolist "Select restart policy:" 14 60 4 \
+        "unless-stopped" "Unless Stopped (Recommended)" ON \
+        "always" "Always" OFF \
+        "on-failure" "On Failure" OFF \
+        "no" "Never" OFF \
+        3>&1 1>&2 2>&3) || exit 1
+
+    msg_ok "Docker settings configured"
+}
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+start() {
+    header_info
+    check_root
+    check_pve
+
+    # Check if running in container (for update mode)
+    if [[ -f /etc/docker-service.conf ]]; then
+        # We're inside a container - run update
+        update_script
+        exit 0
+    fi
+
+    echo ""
+
+    # Mode selection
+    local mode
+    mode=$(whiptail --backtitle "Docker-to-LXC" \
+        --title "Installation Mode" \
+        --radiolist "Choose installation mode:" 14 60 3 \
+        "default" "Default Settings (Quick)" ON \
+        "advanced" "Advanced Settings" OFF \
+        "config" "Load from Config File" OFF \
+        3>&1 1>&2 2>&3) || exit 1
+
+    case "$mode" in
+        default)
+            default_settings
+            ;;
+        advanced)
+            advanced_settings
+            ;;
+        config)
+            local config_file
+            config_file=$(whiptail --backtitle "Docker-to-LXC" \
+                --title "Config File" \
+                --inputbox "Enter path to config file:" 10 70 \
+                3>&1 1>&2 2>&3) || exit 1
+            load_config "$config_file"
+            ;;
+    esac
+
+    # Get Docker settings
+    docker_settings
+
+    # Confirmation
+    local ct_name
+    ct_name=$(sanitize_name "$DOCKER_IMAGE")
+
+    echo ""
+    msg "Configuration Summary:"
+    msg "  Container Name: ${ct_name}"
+    msg "  Docker Image:   ${DOCKER_IMAGE}"
+    msg "  OS:             ${var_os} ${var_version}"
+    msg "  CPU:            ${var_cpu} cores"
+    msg "  RAM:            ${var_ram} MB"
+    msg "  Disk:           ${var_disk} GB"
+    [[ -n "$DOCKER_PORTS" ]] && msg "  Ports:          ${DOCKER_PORTS}"
+    [[ -n "$DOCKER_VOLUMES" ]] && msg "  Volumes:        ${DOCKER_VOLUMES}"
+    echo ""
+
+    if ! whiptail --backtitle "Docker-to-LXC" \
+        --title "Confirm" \
+        --yesno "Create container with these settings?" 10 60; then
+        msg "Installation cancelled"
+        exit 0
+    fi
+
+    # Select network bridge
+    select_bridge
+
+    # Select storage for container rootfs
+    select_storage "rootdir"
+
+    # Select storage for templates (vztmpl)
+    select_template_storage
+
+    # Get template
+    get_template "$var_os" "$var_version"
+
+    # Build container
+    build_container "$ct_name"
+}
+
+description() {
+    local ct_name
+    ct_name=$(sanitize_name "$DOCKER_IMAGE")
+
+    # Get container IP
+    local ip
+    ip=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')
+
+    echo ""
+    msg_ok "Container ${ct_name} created successfully!"
+    echo ""
+    msg "Container Details:"
+    msg "  ID:     ${CTID}"
+    msg "  Name:   ${ct_name}"
+    msg "  IP:     ${ip:-Pending...}"
+    msg "  Image:  ${DOCKER_IMAGE}"
+    echo ""
+
+    if [[ -n "$DOCKER_PORTS" ]]; then
+        msg "Exposed Ports:"
+        IFS=',' read -ra ports <<< "$DOCKER_PORTS"
+        for port in "${ports[@]}"; do
+            msg "  http://${ip}:${port%:*}"
+        done
+        echo ""
+    fi
+
+    msg "Management Commands:"
+    msg "  pct enter ${CTID}           # Enter container shell"
+    msg "  docker logs ${ct_name}      # View service logs (inside container)"
+    msg "  systemctl status docker-${ct_name}  # Check service status (inside container)"
+    echo ""
+}
