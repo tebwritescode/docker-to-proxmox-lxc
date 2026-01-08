@@ -18,7 +18,7 @@ set -Eeuo pipefail
 # CONFIGURATION
 # =============================================================================
 
-SCRIPT_VERSION="1.0.8"
+SCRIPT_VERSION="1.1.0"
 OCI_IMAGE="${OCI_IMAGE:-}"
 CT_NAME="${CT_NAME:-}"
 CT_MEMORY="${CT_MEMORY:-256}"
@@ -352,6 +352,97 @@ select_storage() {
     fi
 }
 
+select_cpu() {
+    [[ -n "$NONINTERACTIVE" ]] && { msg_ok "Using CPU cores: ${CT_CORES}"; return; }
+
+    local selected
+    selected=$(whiptail --backtitle "OCI-to-LXC" \
+        --title "CPU Cores" \
+        --radiolist "How many CPU cores should the LXC get?" 16 50 6 \
+        "1" "1 CPU core" "ON" \
+        "2" "2 CPU cores" "OFF" \
+        "4" "4 CPU cores" "OFF" \
+        "8" "8 CPU cores" "OFF" \
+        "CUSTOM" "Enter custom value" "OFF" \
+        3>&1 1>&2 2>&3) || return
+
+    if [[ "$selected" == "CUSTOM" ]]; then
+        selected=$(whiptail --backtitle "OCI-to-LXC" \
+            --title "Custom CPU Cores" \
+            --inputbox "Enter number of CPU cores:" 8 40 "$CT_CORES" \
+            3>&1 1>&2 2>&3) || return
+    fi
+
+    if [[ "$selected" =~ ^[0-9]+$ ]] && [[ "$selected" -gt 0 ]]; then
+        CT_CORES="$selected"
+        msg_ok "CPU cores: ${CT_CORES}"
+    else
+        msg_error "Invalid CPU value, using default: ${CT_CORES}"
+    fi
+}
+
+select_memory() {
+    [[ -n "$NONINTERACTIVE" ]] && { msg_ok "Using memory: ${CT_MEMORY}MB"; return; }
+
+    local selected
+    selected=$(whiptail --backtitle "OCI-to-LXC" \
+        --title "Memory" \
+        --radiolist "How much memory should the LXC get?" 18 50 7 \
+        "256" "256 MB" "ON" \
+        "512" "512 MB" "OFF" \
+        "1024" "1 GB" "OFF" \
+        "2048" "2 GB" "OFF" \
+        "4096" "4 GB" "OFF" \
+        "8192" "8 GB" "OFF" \
+        "CUSTOM" "Enter custom value (MB)" "OFF" \
+        3>&1 1>&2 2>&3) || return
+
+    if [[ "$selected" == "CUSTOM" ]]; then
+        selected=$(whiptail --backtitle "OCI-to-LXC" \
+            --title "Custom Memory" \
+            --inputbox "Enter memory in MB:" 8 40 "$CT_MEMORY" \
+            3>&1 1>&2 2>&3) || return
+    fi
+
+    if [[ "$selected" =~ ^[0-9]+$ ]] && [[ "$selected" -gt 0 ]]; then
+        CT_MEMORY="$selected"
+        msg_ok "Memory: ${CT_MEMORY}MB"
+    else
+        msg_error "Invalid memory value, using default: ${CT_MEMORY}MB"
+    fi
+}
+
+select_disk() {
+    [[ -n "$NONINTERACTIVE" ]] && { msg_ok "Using disk: ${CT_DISK}GB"; return; }
+
+    local selected
+    selected=$(whiptail --backtitle "OCI-to-LXC" \
+        --title "Disk Size" \
+        --radiolist "How much disk space should the LXC get?" 18 50 7 \
+        "1" "1 GB" "ON" \
+        "2" "2 GB" "OFF" \
+        "4" "4 GB" "OFF" \
+        "8" "8 GB" "OFF" \
+        "16" "16 GB" "OFF" \
+        "32" "32 GB" "OFF" \
+        "CUSTOM" "Enter custom value (GB)" "OFF" \
+        3>&1 1>&2 2>&3) || return
+
+    if [[ "$selected" == "CUSTOM" ]]; then
+        selected=$(whiptail --backtitle "OCI-to-LXC" \
+            --title "Custom Disk Size" \
+            --inputbox "Enter disk size in GB:" 8 40 "$CT_DISK" \
+            3>&1 1>&2 2>&3) || return
+    fi
+
+    if [[ "$selected" =~ ^[0-9]+$ ]] && [[ "$selected" -gt 0 ]]; then
+        CT_DISK="$selected"
+        msg_ok "Disk size: ${CT_DISK}GB"
+    else
+        msg_error "Invalid disk value, using default: ${CT_DISK}GB"
+    fi
+}
+
 # =============================================================================
 # OCI FUNCTIONS
 # =============================================================================
@@ -545,12 +636,18 @@ main() {
     # Set container name from image if not specified
     [[ -z "$CT_NAME" ]] && CT_NAME=$(sanitize_name "$OCI_IMAGE")
 
+    # Select container resources
     echo ""
-    msg "Configuration:"
+    select_cpu
+    select_memory
+    select_disk
+
+    echo ""
+    msg "Configuration Summary:"
     msg "  Image:    ${OCI_IMAGE}"
     msg "  Name:     ${CT_NAME}"
+    msg "  CPU:      ${CT_CORES} core(s)"
     msg "  Memory:   ${CT_MEMORY}MB"
-    msg "  Cores:    ${CT_CORES}"
     msg "  Disk:     ${CT_DISK}GB"
     echo ""
 
